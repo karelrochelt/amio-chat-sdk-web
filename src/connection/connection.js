@@ -16,10 +16,14 @@ import {
 
 class Connection {
 
-  constructor() {
+  constructor(ioClient = io) {
+    this.ioClient = ioClient
     this.online = false
     this.socket = null
     this.config = null
+    this.sessionManager = null
+    this.chatConfig = {}
+    this.connectingPromise = null
 
     this.messageReceivedHandler = () => {
     }
@@ -34,36 +38,29 @@ class Connection {
   }
 
   disconnect() {
+    this.connectingPromise = null
+    this._closeSocket()
+  }
+
+  _closeSocket() {
     if(this.socket) {
       this.socket.disconnect()
+      this.socket = null
     }
   }
 
   connect(config) {
-    return new Promise((resolve, reject) => {
-      const err = validateConfig(config)
-      if(err) {
-        reject(err)
-        return
-      }
-      this.config = config
+    const err = validateConfig(config)
+    if(err) {
+      return Promise.reject(err)
+    }
+    this.config = config
 
-      // for dev purposes: set config._amioChatServerUrl to use a different server
-      const storageType = this.config.storageType || 'local'
-      this.sessionManager = new SessionManager(storageType)
+    // for dev purposes: set config._amioChatServerUrl to use a different server
+    const storageType = this.config.storageType || 'local'
+    this.sessionManager = new SessionManager(storageType)
 
-      const sessionId = this.sessionManager.getSessionId()
-      if(!sessionId) {
-        // if there is no existing session, we don't want to connect to the server immediately
-        resolve()
-        return
-      }
-
-      // a session exists, connect immediately
-      this.ensureConnection().then(() => {
-        resolve()
-      })
-    })
+    return this.ensureConnection()
   }
 
   emit(event, data) {
@@ -85,13 +82,22 @@ class Connection {
     })
   }
 
-  ensureConnection() {
-    return new Promise((resolve, reject) => {
-      if(this.socket) {
-        resolve()
-        return
-      }
+  getSessionId() {
+    if(!this.sessionManager) {
+      return null
+    }
+    return this.sessionManager.getSessionId()
+  }
 
+  ensureConnection() {
+    if(this.socket && this.socket.connected) {
+      return Promise.resolve(this._connectionResult())
+    }
+    if(this.connectingPromise) {
+      return this.connectingPromise
+    }
+
+    this.connectingPromise = new Promise((resolve, reject) => {
       const opts = {
         secure: true,
         reconnection: true,
@@ -117,63 +123,87 @@ class Connection {
         }
       }
 
-      this.disconnect()
-      this.socket = io(serverUrl, opts)
+      this._closeSocket()
+      this.socket = this.ioClient(serverUrl, opts)
+      this._registerSocketHandlers(resolve, reject)
+    })
 
-      this.socket.on(SOCKET_CONNECTION_ACCEPTED, data => {
-        this.sessionManager.setSessionId(data.session_id)
+    return this.connectingPromise
+  }
 
-        this.online = true
-        this.connectionStateChangedHandler(this.online)
+  _connectionResult() {
+    return {
+      chatConfig: this.chatConfig || {}
+    }
+  }
 
-        resolve()
-      })
+  _finishConnection(resolve, result) {
+    this.connectingPromise = null
+    resolve(result)
+  }
 
-      this.socket.on(SOCKET_CONNECTION_REJECTED, error => {
-        if(error.error_code === ERROR_CODE_CHANNEL_ID_CHANGED) {
-          console.warn('Session invalidated by the server. New session will be created automatically.')
-          this.sessionManager.clear()
-          this.socket.off()
-          this.connect(this.config)
-            .then(resolve)
-            .catch(reject)
-          return
-        }
-        reject(`Connection rejected from server. Error: ${JSON.stringify(error)}`)
-      })
+  _failConnection(reject, error) {
+    this.connectingPromise = null
+    reject(error)
+  }
 
-      this.socket.on('reconnect_attempt', () => {
-        // if we didn't set the sessionId here, we could end up with a new one after reconnect
-        const sessionId = this.sessionManager.getSessionId()
-        if(sessionId) {
-          this.socket.io.opts.query.session_id = sessionId
-        }
-      })
+  _registerSocketHandlers(resolve, reject) {
+    this.socket.on(SOCKET_CONNECTION_ACCEPTED, data => {
+      this.sessionManager.setSessionId(data.session_id)
+      this.chatConfig = (data && data.chat_config) || {}
 
-      this.socket.on(SOCKET_IO_DISCONNECT, () => {
-        this.online = false
-        this.connectionStateChangedHandler(this.online)
-      })
+      this.online = true
+      this.connectionStateChangedHandler(this.online)
 
-      this.socket.on(SOCKET_IO_ERROR, (err) => {
-        console.error('Received error from server:', err)
-      })
+      this._finishConnection(resolve, this._connectionResult())
+    })
 
-      this.socket.on(SOCKET_MESSAGE_SERVER, data => {
-        this.messageReceivedHandler(data)
-      })
+    this.socket.on(SOCKET_CONNECTION_REJECTED, error => {
+      if(error.error_code === ERROR_CODE_CHANNEL_ID_CHANGED) {
+        console.warn('Session invalidated by the server. New session will be created automatically.')
+        this.sessionManager.clear()
+        this.socket.off()
+        this._closeSocket()
+        this.connectingPromise = null
+        this.connect(this.config)
+          .then(resolve)
+          .catch(reject)
+        return
+      }
+      this._failConnection(reject, `Connection rejected from server. Error: ${JSON.stringify(error)}`)
+    })
 
-      this.socket.on(SOCKET_MESSAGE_ECHO, data => {
-        this.messageEchoHandler(data)
-      })
+    this.socket.on('reconnect_attempt', () => {
+      // if we didn't set the sessionId here, we could end up with a new one after reconnect
+      const sessionId = this.sessionManager.getSessionId()
+      if(sessionId) {
+        this.socket.io.opts.query.session_id = sessionId
+      }
+    })
 
-      this.socket.on(SOCKET_NOTIFICATION_SERVER, data => {
-        this.notificationReceivedHandler(data)
-      })
+    this.socket.on(SOCKET_IO_DISCONNECT, () => {
+      this.online = false
+      this.connectionStateChangedHandler(this.online)
+    })
 
-      this.socket.on(SOCKET_VOICE_RT_RESULT, data => {
-        this.dictationResultReceived(data)
-      })
+    this.socket.on(SOCKET_IO_ERROR, (err) => {
+      console.error('Received error from server:', err)
+    })
+
+    this.socket.on(SOCKET_MESSAGE_SERVER, data => {
+      this.messageReceivedHandler(data)
+    })
+
+    this.socket.on(SOCKET_MESSAGE_ECHO, data => {
+      this.messageEchoHandler(data)
+    })
+
+    this.socket.on(SOCKET_NOTIFICATION_SERVER, data => {
+      this.notificationReceivedHandler(data)
+    })
+
+    this.socket.on(SOCKET_VOICE_RT_RESULT, data => {
+      this.dictationResultReceived(data)
     })
   }
 
@@ -214,4 +244,5 @@ function validateConfig(config) {
   return null
 }
 
+export { Connection }
 export default new Connection()
